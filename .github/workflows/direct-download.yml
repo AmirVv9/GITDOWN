@@ -1,0 +1,197 @@
+name: Advanced Direct Download & Archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Direct download link'
+        required: true
+        type: string
+      password:
+        description: 'Password for the archive (optional, leave blank for none)'
+        required: false
+        type: string
+        default: ''
+      split_size:
+        description: 'Split size in MB (e.g., 90)'
+        required: true
+        type: string
+        default: '90'
+
+jobs:
+  download-package-store:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/cache/checkout@v4
+
+      - name: Setup Environment & Install 7-Zip
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full curl bc
+
+      - name: Download File Intelligently
+        id: download
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          FILENAME=$(curl -sIL "$URL" | grep -o -E 'filename="?([^"]+)"?' | sed -E 's/filename="?(.+)"?/\1/' | tail -1)
+          if [ -z "$FILENAME" ]; then
+            FILENAME=$(basename "$URL" | cut -d '?' -f 1)
+          fi
+          FILENAME=$(echo "$FILENAME" | sed -e 's/[^a-zA-Z0-9._-]/_/g')
+          if [ -z "$FILENAME" ]; then
+            FILENAME="downloaded_file"
+            echo "::warning::Could not determine filename. Using 'downloaded_file'."
+          fi
+          echo "Original URL: $URL"
+          echo "Detected Filename: $FILENAME"
+
+          echo "Downloading with retry logic..."
+          curl -C - --retry 3 --retry-delay 10 -L -o "$FILENAME" "$URL"
+          if [ $? -ne 0 ]; then
+              echo "::error::Download failed!"
+              exit 1
+          fi
+          echo "Download successful."
+          ls -lh "$FILENAME"
+
+          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+
+      - name: Detect Category, Size & Create Structure
+        id: categorize
+        run: |
+          FILENAME="${{ steps.download.outputs.filename }}"
+          EXT="${FILENAME##*.}"
+          EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+          CATEGORY="others"
+          case "$EXT_LOWER" in
+            mp4|mkv|avi|mov|wmv|flv|webm|m4v)
+              CATEGORY="videos"
+              ;;
+            mp3|wav|flac|aac|ogg|wma|m4a)
+              CATEGORY="audio"
+              ;;
+            jpg|jpeg|png|gif|bmp|svg|webp|tiff|ico)
+              CATEGORY="images"
+              ;;
+            pdf|doc|docx|xls|xlsx|ppt|pptx|txt|csv|json|xml|zip|rar|7z|tar|gz|epub|mobi)
+              CATEGORY="documents"
+              ;;
+          esac
+
+          WORK_DIR="downloads/${CATEGORY}/${FILENAME}"
+          mkdir -p "$WORK_DIR"
+          mv "$FILENAME" "$WORK_DIR/"
+          
+          # Get file size in bytes and MB (integer)
+          FILE_SIZE_BYTES=$(stat -c %s "${WORK_DIR}/${FILENAME}")
+          FILE_SIZE_MB=$(echo "scale=0; $FILE_SIZE_BYTES / 1048576" | bc)
+          
+          echo "Category: $CATEGORY"
+          echo "File size: ${FILE_SIZE_MB} MB"
+          echo "category=$CATEGORY" >> $GITHUB_OUTPUT
+          echo "work_dir=$WORK_DIR" >> $GITHUB_OUTPUT
+          echo "file_size_mb=$FILE_SIZE_MB" >> $GITHUB_OUTPUT
+
+      - name: Compress, Encrypt (Optional), and Split (Only if > 95MB)
+        id: archive
+        run: |
+          WORK_DIR="${{ steps.categorize.outputs.work_dir }}"
+          FILENAME="${{ steps.download.outputs.filename }}"
+          FILE_SIZE_MB="${{ steps.categorize.outputs.file_size_mb }}"
+          PASSWORD="${{ github.event.inputs.password }}"
+          SPLIT_SIZE="${{ github.event.inputs.split_size }}"
+          THRESHOLD=95
+
+          cd "$WORK_DIR"
+
+          if [ "$FILE_SIZE_MB" -le "$THRESHOLD" ]; then
+            echo "File is ${FILE_SIZE_MB}MB (≤ ${THRESHOLD}MB). Skipping compression. Storing raw file."
+            echo "compressed=false" >> $GITHUB_OUTPUT
+            echo "part_count=1" >> $GITHUB_OUTPUT
+            echo "archive_name=$FILENAME" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "File is ${FILE_SIZE_MB}MB (> ${THRESHOLD}MB). Starting compression..."
+
+          CMD="7z a -mx=9"
+          ARCHIVE_NAME="archive.7z"
+          if [ -n "$PASSWORD" ]; then
+            echo "Encryption enabled."
+            CMD="$CMD -p$PASSWORD -mhe=on"
+            ARCHIVE_NAME="secure_archive.7z"
+          else
+            echo "No password provided."
+            ARCHIVE_NAME="archive.7z"
+          fi
+
+          FULL_CMD="$CMD -v${SPLIT_SIZE}m $ARCHIVE_NAME $FILENAME"
+          echo "Running: $FULL_CMD"
+          eval "$FULL_CMD"
+
+          if [ $? -ne 0 ]; then
+            echo "::error::Archive creation failed!"
+            exit 1
+          fi
+
+          echo "Removing original file: $FILENAME"
+          rm -f "$FILENAME"
+
+          PART_COUNT=$(ls ${ARCHIVE_NAME}.* 2>/dev/null | wc -l)
+          echo "Archive parts created: $PART_COUNT"
+          echo "compressed=true" >> $GITHUB_OUTPUT
+          echo "part_count=$PART_COUNT" >> $GITHUB_OUTPUT
+          echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Write Manifest File
+        run: |
+          WORK_DIR="${{ steps.categorize.outputs.work_dir }}"
+          ARCHIVE_NAME="${{ steps.archive.outputs.archive_name }}"
+          PART_COUNT="${{ steps.archive.outputs.part_count }}"
+          PASSWORD_SET="${{ github.event.inputs.password }}"
+          COMPRESSED="${{ steps.archive.outputs.compressed }}"
+          ENCRYPTED="false"
+          if [ -n "$PASSWORD_SET" ]; then ENCRYPTED="true"; fi
+
+          cat > "$WORK_DIR/manifest.json" << EOF
+          {
+            "original_filename": "${{ steps.download.outputs.filename }}",
+            "category": "${{ steps.categorize.outputs.category }}",
+            "compressed": $([ "$COMPRESSED" = "true" ] && echo "true" || echo "false"),
+            "archive_name": "$ARCHIVE_NAME",
+            "split_parts": $PART_COUNT,
+            "split_size_mb": ${{ github.event.inputs.split_size }},
+            "encrypted": $ENCRYPTED,
+            "reassembly_instructions": "$([ "$COMPRESSED" = "true" ] && echo "Download all parts and the manifest. Use '7z x ${ARCHIVE_NAME}.001' to extract." || echo "File stored as-is. No extraction needed.")"
+          }
+          EOF
+          echo "Manifest created."
+          cat "$WORK_DIR/manifest.json"
+
+      - name: Commit & Push Files to Repository
+        env:
+          WORK_DIR: ${{ steps.categorize.outputs.work_dir }}
+          FILENAME: ${{ steps.download.outputs.filename }}
+          CATEGORY: ${{ steps.categorize.outputs.category }}
+          COMPRESSED: ${{ steps.archive.outputs.compressed }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "${WORK_DIR}/"
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit. This might indicate an issue."
+            exit 1
+          fi
+
+          if [ "$COMPRESSED" = "true" ]; then
+            COMMIT_MSG="Add ${CATEGORY}: ${FILENAME} (compressed)"
+          else
+            COMMIT_MSG="Add ${CATEGORY}: ${FILENAME} (raw, no compression)"
+          fi
+          
+          git commit -m "$COMMIT_MSG"
+          git push
+          echo "All files committed and pushed successfully."
