@@ -17,18 +17,41 @@ on:
         required: true
         type: string
         default: '90'
+      cleanup_previous:
+        description: 'Remove ALL previous downloads before this one? (true / false)'
+        required: true
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+        default: 'true'
 
 jobs:
   download-package-store:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/cache/checkout@v4
+        uses: actions/checkout@v4
 
       - name: Setup Environment & Install 7-Zip
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq p7zip-full curl bc
+
+      - name: Cleanup Previous Downloads (if requested)
+        if: github.event.inputs.cleanup_previous == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -d "downloads" ]; then
+            echo "Removing all previously downloaded files..."
+            git rm -r downloads/
+            git commit -m "Cleanup before new download" || echo "No previous downloads to remove."
+            git push
+            echo "Cleanup complete. Repository is ready for new file."
+          else
+            echo "No 'downloads' folder found. Skipping cleanup."
+          fi
 
       - name: Download File Intelligently
         id: download
@@ -83,7 +106,6 @@ jobs:
           mkdir -p "$WORK_DIR"
           mv "$FILENAME" "$WORK_DIR/"
           
-          # Get file size in bytes and MB (integer)
           FILE_SIZE_BYTES=$(stat -c %s "${WORK_DIR}/${FILENAME}")
           FILE_SIZE_MB=$(echo "scale=0; $FILE_SIZE_BYTES / 1048576" | bc)
           
@@ -154,6 +176,12 @@ jobs:
           ENCRYPTED="false"
           if [ -n "$PASSWORD_SET" ]; then ENCRYPTED="true"; fi
 
+          if [ "$COMPRESSED" = "true" ]; then
+            INSTRUCTIONS="Download all parts and the manifest. Use '7z x ${ARCHIVE_NAME}.001' to extract."
+          else
+            INSTRUCTIONS="File stored as-is. No extraction needed."
+          fi
+
           cat > "$WORK_DIR/manifest.json" << EOF
           {
             "original_filename": "${{ steps.download.outputs.filename }}",
@@ -163,7 +191,7 @@ jobs:
             "split_parts": $PART_COUNT,
             "split_size_mb": ${{ github.event.inputs.split_size }},
             "encrypted": $ENCRYPTED,
-            "reassembly_instructions": "$([ "$COMPRESSED" = "true" ] && echo "Download all parts and the manifest. Use '7z x ${ARCHIVE_NAME}.001' to extract." || echo "File stored as-is. No extraction needed.")"
+            "reassembly_instructions": "$INSTRUCTIONS"
           }
           EOF
           echo "Manifest created."
